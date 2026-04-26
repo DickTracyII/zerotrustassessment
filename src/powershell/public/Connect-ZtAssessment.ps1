@@ -214,7 +214,6 @@ function Connect-ZtAssessment {
 
 				$connectMgGraphParams = @{
 					NoWelcome = $true
-					UseDeviceCode = $UseDeviceCode.IsPresent
 					Environment = $Environment
 					# TenantId = $TenantId
 					# ClientId = $ClientId
@@ -229,9 +228,12 @@ function Connect-ZtAssessment {
 				}
 
 				if ($Certificate) {
+					# UseDeviceCode is in a different parameter set from Certificate in Connect-MgGraph.
+					# Only add UseDeviceCode when not authenticating with a certificate.
 					$connectMgGraphParams.Certificate = $Certificate
 				}
 				else {
+					$connectMgGraphParams.UseDeviceCode = $UseDeviceCode.IsPresent
 					$connectMgGraphParams.Scopes = Get-ZtGraphScope
 				}
 
@@ -368,7 +370,6 @@ function Connect-ZtAssessment {
 				}
 
 				$azParams = @{
-					UseDeviceAuthentication = $UseDeviceCode
 					Environment             = $azEnvironment
 					# Tenant                  = $tenantParam
 				}
@@ -379,8 +380,13 @@ function Connect-ZtAssessment {
 				}
 
 				if ($ClientId -and $Certificate) {
+					# UseDeviceAuthentication is in a different parameter set from ApplicationId/CertificateThumbprint.
+					# Only add UseDeviceAuthentication when not authenticating with a service principal certificate.
 					$azParams.ApplicationId = $ClientId
 					$azParams.CertificateThumbprint = $Certificate.Certificate.Thumbprint
+				}
+				else {
+					$azParams.UseDeviceAuthentication = $UseDeviceCode
 				}
 
 				Write-Verbose -Message ("Connecting to Azure with parameters: {0}" -f ($azParams | Out-String))
@@ -424,8 +430,29 @@ function Connect-ZtAssessment {
 
 			try {
 					Write-PSFMessage -Message "Connecting to Azure Information Protection" -Level Verbose
-					# Connect-AipService does not have parameters for non-interactive auth, so it will use the existing Graph connection context if available, or prompt if not.
-					$null = Connect-AipService -ErrorAction Stop
+					if ($ClientId -and $Certificate) {
+						# App-only certificate auth — no interactive prompt.
+						# Use -ServicePrincipal:$true (not bare switch) for compatibility with implicit remoting proxy functions.
+						# Map ZT environment names to AipService EnvironmentName enum values.
+						$aipEnvironment = switch ($Environment) {
+							'USGov'    { 'AzureUSGovernment' }
+							'USGovDoD' { 'AzureUSGovernment3' }
+							'China'    { 'AzureChinaCloud' }
+							default    { 'AzureCloud' }
+						}
+						$aipParams = @{
+							ServicePrincipal      = $true
+							ApplicationId         = $ClientId
+							CertificateThumbprint = $Certificate.Certificate.Thumbprint
+							TenantId              = $TenantId
+							EnvironmentName       = $aipEnvironment
+							ErrorAction           = 'Stop'
+						}
+						$null = Connect-AipService @aipParams
+					} else {
+						# Connect-AipService does not have parameters for non-interactive auth, so it will use the existing Graph connection context if available, or prompt if not.
+						$null = Connect-AipService -ErrorAction Stop
+					}
 					Write-Host -Object "   ✅ Connected" -ForegroundColor Green
 					Add-ZtConnectedService -Service 'AipService'
 			}
@@ -453,19 +480,29 @@ function Connect-ZtAssessment {
 				}
 
 				Write-Verbose -Message 'Connecting to Microsoft Exchange Online'
-				if ($UseDeviceCode) {
-					$null = Connect-ExchangeOnline -ShowBanner:$false -Device:$UseDeviceCode -ExchangeEnvironmentName $ExchangeEnvironmentName -ErrorAction Stop
+				if ($ClientId -and $Certificate) {
+					# App-only certificate auth — no interactive prompt.
+					# Connect-ExchangeOnline requires an org domain (not a GUID) for -Organization.
+					$exoOrg = $TenantId
+					if ($exoOrg -and $exoOrg -notmatch '\.') {
+						# TenantId is a GUID — resolve the initial domain from Graph
+						try {
+							$org = Invoke-ZtGraphRequest -RelativeUri 'organization' -ErrorAction SilentlyContinue
+							$exoOrg = ($org | Select-Object -First 1).verifiedDomains | Where-Object { $_.isInitial } | Select-Object -ExpandProperty name -First 1
+						} catch { }
+					}
+					$exoParams = @{
+						AppId                   = $ClientId
+						CertificateThumbprint   = $Certificate.Certificate.Thumbprint
+						Organization            = $exoOrg
+						ExchangeEnvironmentName = $ExchangeEnvironmentName
+						ShowBanner              = $false
+						ErrorAction             = 'Stop'
+					}
+					$null = Connect-ExchangeOnline @exoParams
 				}
 				else {
-					$null = Connect-ExchangeOnline -ShowBanner:$false -ExchangeEnvironmentName $ExchangeEnvironmentName -ErrorAction Stop
-				}
-
-				# Fix for Get-Label visibility in other scopes
-				if (Get-Command -Name Get-Label -ErrorAction Ignore) {
-					$module = Get-Command -Name Get-Label | Select-Object -ExpandProperty Module
-					if ($module -and $module.Name -like 'tmp_*') {
-						Import-Module $module -Global #-Force
-					}
+					Connect-ExchangeOnline -ShowBanner:$false -ExchangeEnvironmentName $ExchangeEnvironmentName -ErrorAction Stop
 				}
 
 				Write-Host -Object "   ✅ Connected" -ForegroundColor Green
@@ -485,27 +522,27 @@ function Connect-ZtAssessment {
 			$Environments = @{
 				'O365China'        = @{
 					ConnectionUri    = 'https://ps.compliance.protection.partner.outlook.cn/powershell-liveid'
-					AuthZEndpointUri = 'https://login.chinacloudapi.cn/common'
+					AuthZEndpointUri = 'https://login.chinacloudapi.cn/organizations'
 				}
 				'O365GermanyCloud' = @{
 					ConnectionUri    = 'https://ps.compliance.protection.outlook.com/powershell-liveid/'
-					AuthZEndpointUri = 'https://login.microsoftonline.com/common'
+					AuthZEndpointUri = 'https://login.microsoftonline.com/organizations'
 				}
 				'O365Default'      = @{
 					ConnectionUri    = 'https://ps.compliance.protection.outlook.com/powershell-liveid/'
-					AuthZEndpointUri = 'https://login.microsoftonline.com/common'
+					AuthZEndpointUri = 'https://login.microsoftonline.com/organizations'
 				}
 				'O365USGovGCCHigh' = @{
 					ConnectionUri    = 'https://ps.compliance.protection.office365.us/powershell-liveid/'
-					AuthZEndpointUri = 'https://login.microsoftonline.us/common'
+					AuthZEndpointUri = 'https://login.microsoftonline.us/organizations'
 				}
 				'O365USGovDoD'     = @{
-					ConnectionUri    = 'https://l5.ps.compliance.protection.office365.us/powershell-liveid/'
-					AuthZEndpointUri = 'https://login.microsoftonline.us/common'
+					ConnectionUri    = 'https://compliance.dod.microsoft.com/powershell-liveid'
+					AuthZEndpointUri = 'https://login.microsoftonline.us/organizations'
 				}
 				Default            = @{
 					ConnectionUri    = 'https://ps.compliance.protection.outlook.com/powershell-liveid/'
-					AuthZEndpointUri = 'https://login.microsoftonline.com/common'
+					AuthZEndpointUri = 'https://login.microsoftonline.com/organizations'
 				}
 			}
 
@@ -535,34 +572,53 @@ function Connect-ZtAssessment {
 			}
 			elseif ($exoSnCModulesLoaded) {
 				try {
-					# Get UPN from Exchange connection or Graph context
-					#TODO: is that a nice to have or a hard dependency?
-					$ExoUPN = $UserPrincipalName
-
-					# Attempt to resolve UPN before any connection to avoid token acquisition failures without identity
-					$connectionInformation = $null
-					try {
-						$connectionInformation = Get-ConnectionInformation
+					if ($ClientId -and $Certificate) {
+						# App-only certificate auth — no UPN needed.
+						$ippsOrg = $TenantId
+						if ($ippsOrg -and $ippsOrg -notmatch '\.') {
+							try {
+								$org = Invoke-ZtGraphRequest -RelativeUri 'organization' -ErrorAction SilentlyContinue
+								$ippsOrg = ($org | Select-Object -First 1).verifiedDomains | Where-Object { $_.isInitial } | Select-Object -ExpandProperty name -First 1
+							} catch { }
+						}
+						$ippSessionParams = @{
+						AppId       = $ClientId
+						Certificate = $Certificate.Certificate
+						Organization = $ippsOrg
+						ShowBanner   = $false
+						ErrorAction  = 'Stop'
+						}
 					}
-					catch {
-						# Intentionally swallow errors here; fall back to provided UPN if any
-						$connectionInfoError = $_
-						Write-Verbose -Message "Get-ConnectionInformation failed; falling back to provided UserPrincipalName if available. Error: $($connectionInfoError.Exception.Message)"
-					}
+					else {
+						# Delegated / interactive auth — requires a UPN.
+						#TODO: is that a nice to have or a hard dependency?
+						$ExoUPN = $UserPrincipalName
 
-					if (-not $ExoUPN) {
-						$ExoUPN = $connectionInformation | Where-Object { $_.IsEopSession -ne $true -and $_.State -eq 'Connected' } | Select-Object -ExpandProperty UserPrincipalName -First 1 -ErrorAction SilentlyContinue
-					}
+						# Attempt to resolve UPN before any connection to avoid token acquisition failures without identity
+						$connectionInformation = $null
+						try {
+							$connectionInformation = Get-ConnectionInformation
+						}
+						catch {
+							# Intentionally swallow errors here; fall back to provided UPN if any
+							$connectionInfoError = $_
+							Write-Verbose -Message "Get-ConnectionInformation failed; falling back to provided UserPrincipalName if available. Error: $($connectionInfoError.Exception.Message)"
+						}
 
-					if (-not $ExoUPN) {
-						throw "`nUnable to determine a UserPrincipalName for Security & Compliance. Please supply -UserPrincipalName or connect to Exchange Online first."
-					}
+						if (-not $ExoUPN) {
+							$ExoUPN = $connectionInformation | Where-Object { $_.IsEopSession -ne $true -and $_.State -eq 'Connected' } | Select-Object -ExpandProperty UserPrincipalName -First 1 -ErrorAction SilentlyContinue
+						}
 
-					$ippSessionParams = @{
-						BypassMailboxAnchoring = $true
-						UserPrincipalName      = $ExoUPN
-						ShowBanner             = $false
-						ErrorAction            = 'Stop'
+						if (-not $ExoUPN) {
+							throw "`nUnable to determine a UserPrincipalName for Security & Compliance. Please supply -UserPrincipalName or connect to Exchange Online first."
+						}
+
+						$ippSessionParams = @{
+							BypassMailboxAnchoring = $true
+							UserPrincipalName      = $ExoUPN
+							ShowBanner             = $false
+							ErrorAction            = 'Stop'
+						}
 					}
 
 					# Only override endpoints for non-default clouds to reduce token acquisition failures in Default
@@ -571,7 +627,7 @@ function Connect-ZtAssessment {
 						$ippSessionParams.AzureADAuthorizationEndpointUri = $Environments[$ExchangeEnvironmentName].AuthZEndpointUri
 					}
 
-					Write-Verbose -Message "Connecting to Security & Compliance with UPN: $ExoUPN"
+					Write-Verbose -Message "Connecting to Security & Compliance"
 					Connect-IPPSSession @ippSessionParams
 					Write-Host -Object "   ✅ Connected" -ForegroundColor Green
 
@@ -691,7 +747,24 @@ function Connect-ZtAssessment {
 			}
 			else {
 				try {
-					Connect-SPOService -Url $adminUrl -ErrorAction Stop
+					if ($ClientId -and $Certificate) {
+						# App-only certificate auth.
+						$spoParams = @{
+							Url                   = $adminUrl
+							ClientId              = $ClientId
+							CertificateThumbprint = $Certificate.Certificate.Thumbprint
+							TenantId              = $TenantId
+							ErrorAction           = 'Stop'
+						}
+						switch ($Environment) {
+							'USGov'    { $spoParams['Region'] = 'ITAR' }
+							'USGovDoD' { $spoParams['Region'] = 'ITAR' }
+						}
+						Connect-SPOService @spoParams
+					}
+					else {
+						Connect-SPOService -Url $adminUrl -ErrorAction Stop
+					}
 					Write-Host -Object "   ✅ Connected" -ForegroundColor Green
 					Add-ZtConnectedService -Service 'SharePointOnline'
 				}

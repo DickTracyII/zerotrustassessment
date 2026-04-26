@@ -14,7 +14,17 @@ function Add-ZtDeviceWindowsEnrollment
     $activity = "Getting Windows enrollment summary"
     Write-ZtProgress -Activity $activity -Status "Processing"
 
-    $policies = Invoke-ZtGraphRequest -RelativeUri 'Policies/MobileDeviceManagementPolicies' -QueryParameters @{ '$expand' = 'includedGroups' } -ApiVersion 'beta'
+    try {
+        $policies = Invoke-ZtGraphRequest -RelativeUri 'Policies/MobileDeviceManagementPolicies' -QueryParameters @{ '$expand' = 'includedGroups' } -ApiVersion 'beta'
+    } catch {
+        # MobileDeviceManagementPolicies does not support app-only (application) auth.
+        # When running as a service principal the call returns 401. Skip gracefully so
+        # the rest of the device pillar still renders.
+        Write-ZtProgress -Activity $activity -Status "Skipped (app-only auth not supported for MDM policies)"
+        Write-PSFMessage -Message "Add-ZtDeviceWindowsEnrollment: Skipping MDM policy collection — endpoint requires delegated auth. Error: $_" -Level Warning
+        Add-ZtTenantInfo -Name "ConfigWindowsEnrollment" -Value @()
+        return
+    }
 
     # Sort policies by AppliesTo (descending) then by DisplayName (ascending)
     $sortedPolicies = $policies | Sort-Object @{Expression='appliesTo';Descending=$true}, @{Expression='displayName';Ascending=$true}
