@@ -90,6 +90,15 @@ function Connect-ZtAssessment {
 		[string]
 		$SharePointAdminUrl,
 
+		# Path to a PFX certificate file. Used by Connect-SPOService which requires a file path rather than
+		# an X509Certificate2 object. If omitted, the Certificate parameter is used where possible.
+		[string]
+		$CertificatePath,
+
+		# Password for the PFX certificate file specified in CertificatePath.
+		[SecureString]
+		$CertificatePassword,
+
 		# When specified, forces reconnection to services even if an existing connection is detected.
 		# This is useful to refresh the connection context and permissions.
 		[switch]
@@ -549,8 +558,10 @@ function Connect-ZtAssessment {
 			$exoSnCModulesLoaded = $false
 			try {
 				$loadedExoSnCModules = $resolvedRequiredModules.SecurityCompliance.ForEach{
-					#TODO: only add -UseWindowsPowerShell for the modules in WindowsRequiredModules based on module manifest.
-					$_ | Import-Module -Global -ErrorAction Stop -PassThru -WarningAction SilentlyContinue
+					# Use -UseWindowsPowerShell so Connect-IPPSSession runs via PS5/netFramework.
+					# The netCore EXO 3.9.0 bundled with ZTA throws NullReferenceException in
+					# New-EXOModule during PS7 cert-based auth; the PS5 netFramework version works.
+					$_ | Import-Module -Global -ErrorAction Stop -PassThru -UseWindowsPowerShell -WarningAction SilentlyContinue
 				}
 
 				$loadedExoSnCModules.ForEach{
@@ -582,12 +593,16 @@ function Connect-ZtAssessment {
 							} catch { }
 						}
 						$ippSessionParams = @{
-						AppId       = $ClientId
-						Certificate = $Certificate.Certificate
-						Organization = $ippsOrg
-						ShowBanner   = $false
-						ErrorAction  = 'Stop'
+						AppId                 = $ClientId
+						CertificateThumbprint = $Certificate.Certificate.Thumbprint
+						Organization          = $ippsOrg
+						ShowBanner            = $false
+						ErrorAction           = 'Stop'
 						}
+						# Always use CertificateThumbprint (plain string) rather than CertificateFilePath.
+						# The module is loaded via -UseWindowsPowerShell (implicit remoting), and
+						# SecureString cannot be serialised across the PS5/PS7 boundary. The cert is
+						# already in Cert:\CurrentUser\My from New-SelfSignedCertificate, so thumbprint works.
 					}
 					else {
 						# Delegated / interactive auth — requires a UPN.
@@ -692,6 +707,15 @@ function Connect-ZtAssessment {
 			}
 
 			[string] $adminUrl = $null
+
+			# SharePoint admin URL suffix varies by cloud environment
+			$spoAdminSuffix = switch ($Environment) {
+				'USGov'    { '-admin.sharepoint.us' }       # GCC High
+				'USGovDoD' { '-admin.sharepoint.mil.us' }   # DoD
+				'China'    { '-admin.sharepoint.cn' }
+				default    { '-admin.sharepoint.com' }      # Public / GCC
+			}
+
 			if (-not [string]::IsNullOrEmpty($SharePointAdminUrl)) {
 				Write-Verbose -Message "Using provided SharePoint Admin URL: $SharePointAdminUrl"
 				$adminUrl = $SharePointAdminUrl # Attempt to read from parameter
@@ -701,10 +725,20 @@ function Connect-ZtAssessment {
 				if ($graphContext.TenantId) {
 					try {
 						$org = Invoke-ZtGraphRequest -RelativeUri 'organization'
-						$initialDomain = $org.verifiedDomains | Where-Object { $_.isInitial } | Select-Object -ExpandProperty name -First 1
+						$orgObj = $org | Select-Object -First 1
+						# Prefer the isInitial domain; fall back to any *.onmicrosoft.com domain
+						$initialDomain = $orgObj.verifiedDomains | Where-Object { $_.isInitial } | Select-Object -ExpandProperty name -First 1
+						if (-not $initialDomain) {
+							$initialDomain = $orgObj.verifiedDomains |
+								Where-Object { $_.name -match '^[^.]+\.onmicrosoft\.com$' -and $_.name -notmatch '\.mail\.onmicrosoft\.com$' } |
+								Select-Object -ExpandProperty name -First 1
+							if ($initialDomain) {
+								Write-Verbose -Message "isInitial domain not found; using onmicrosoft.com fallback: $initialDomain"
+							}
+						}
 						if ($initialDomain) {
 							$tenantName = $initialDomain.Split('.')[0]
-							$adminUrl = "https://$tenantName-admin.sharepoint.com"
+							$adminUrl = "https://$tenantName$spoAdminSuffix"
 							Write-Verbose -Message "Inferred SharePoint Admin URL from Graph: $adminUrl"
 						}
 					}
@@ -726,7 +760,7 @@ function Connect-ZtAssessment {
 					$initialDomain = $tenantDetails.Domains.Where({ $_ -match '^[^.]+\.onmicrosoft\.com$' }, 1) | Select-Object -First 1
 					if ($initialDomain) {
 						$tenantName = $initialDomain.Split('.')[0]
-						$adminUrl = "https://$tenantName-admin.sharepoint.com"
+						$adminUrl = "https://$tenantName$spoAdminSuffix"
 						Write-Verbose -Message "Inferred SharePoint Admin URL from Azure context: $adminUrl"
 					}
 				}
@@ -749,12 +783,20 @@ function Connect-ZtAssessment {
 				try {
 					if ($ClientId -and $Certificate) {
 						# App-only certificate auth.
+						# Connect-SPOService works most reliably with -CertificatePath + -CertificatePassword
+						# (file-based). Thumbprint requires cert to be installed in the Windows store.
 						$spoParams = @{
-							Url                   = $adminUrl
-							ClientId              = $ClientId
-							CertificateThumbprint = $Certificate.Certificate.Thumbprint
-							TenantId              = $TenantId
-							ErrorAction           = 'Stop'
+							Url         = $adminUrl
+							ClientId    = $ClientId
+							TenantId    = $TenantId
+							ErrorAction = 'Stop'
+						}
+						if ($CertificatePath -and (Test-Path $CertificatePath)) {
+							$spoParams['CertificatePath'] = $CertificatePath
+							if ($CertificatePassword) { $spoParams['CertificatePassword'] = $CertificatePassword }
+						} else {
+							# Fall back: requires cert installed in Windows certificate store
+							$spoParams['CertificateThumbprint'] = $Certificate.Certificate.Thumbprint
 						}
 						switch ($Environment) {
 							'USGov'    { $spoParams['Region'] = 'ITAR' }
